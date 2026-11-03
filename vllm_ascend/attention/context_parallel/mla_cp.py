@@ -925,6 +925,7 @@ class AscendMlaDCPImpl(DCPImplMixin, AscendMLAImpl):
         return self._v_up_proj_batch_major(attn_output)
 
     def _forward_decode(
+            
         self,
         decode_preprocess_res: DecodeMLAPreprocessResult,
         block_size: int,
