@@ -1915,7 +1915,19 @@ def use_updatable_graph(
 ) -> bool:
     from vllm_ascend.attention.attention_v1 import AscendAttentionBackend
 
-    return attn_backend is not None and issubclass(attn_backend, AscendAttentionBackend)
+    if attn_backend is None:
+        return False
+    if issubclass(attn_backend, AscendAttentionBackend):
+        return True
+
+    # MLA DCP registers its FIA-v2 tasks with UpdatableGraph independently
+    # from the GQA attention backend implementation.
+    from vllm_ascend.attention.context_parallel.mla_cp import AscendMlaDCPMetadataBuilder
+    from vllm_ascend.attention.mla_v1 import AscendMLABackend
+
+    return issubclass(attn_backend, AscendMLABackend) and (
+        attn_backend.get_builder_cls() is AscendMlaDCPMetadataBuilder
+    )
 
 
 def _is_glm_model(model_config) -> bool:
