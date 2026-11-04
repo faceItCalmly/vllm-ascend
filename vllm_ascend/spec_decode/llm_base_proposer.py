@@ -662,6 +662,20 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             for draft_step, per_step_metadata in enumerate(multi_steps_attn_metadata):
                 for layer_name, metadata in per_step_metadata.items():
                     if self.dcp_size > 1:
+                        if self.draft_model_config.use_mla:
+                            # MLA 使用 FIA-v2 参数名和 decode.block_table；不能走 GQA 发布函数。
+                            # 延迟导入避免 attention backend 与 proposer 的循环导入。
+                            from vllm_ascend.attention.context_parallel.mla_cp import build_mla_dcp_fia_params
+
+                            update_params.extend(
+                                build_mla_dcp_fia_params(
+                                    layer_name,
+                                    metadata,
+                                    is_draft_model_prefill=draft_step == 0,
+                                )
+                            )
+                            # 本层的 MLA 参数已发布，跳过下面只适用于 GQA 的处理。
+                            continue
                         # Import lazily: attention backends also import spec-decode utilities.
                         from vllm_ascend.attention.context_parallel.attention_cp import build_dcp_fia_params
 

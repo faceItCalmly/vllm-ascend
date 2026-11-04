@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from math import lcm
 
 import numpy as np
@@ -51,12 +51,13 @@ class MLADCPParamProvider:
 
     metadata_layer_name: str | None
     attention_kind: CPKVScope
-    pad_to: int | None = None
+    # SharedSource 只按“层名 + KV 范围”分组，Provider 的相等/哈希规则也须保持一致。
+    # draft-prefill 与后续 decode 的 token 数可能不同；填充长度仍保留，但不参与身份比较。
+    pad_to: int | None = field(default=None, compare=False)
 
     @property
     def layer_name(self) -> tuple[str | None, CPKVScope]:
-        # SharedSource uses this identity to bind draft tasks to their layer
-        # and KV scope without relying on capture order.
+        # SharedSource 先按“层名 + KV 范围”分组，同组再按 draft step 出现顺序匹配。
         return self.metadata_layer_name, self.attention_kind
 
     def resolve(self, attn_metadata) -> dict[str, object]:
@@ -84,6 +85,7 @@ class MLADCPParamProvider:
             "block_table": block_table,
         }
         if self.attention_kind is not CPKVScope.FULL:
+            # FULL 保留捕获时的 BNSD/BSND query 长度语义；拆分 TND 任务更新累计长度。
             params["actual_seq_qlen"] = query_lens
         if self.pad_to is not None and len(kv_lens) < self.pad_to:
             params["actual_seq_kvlen"] = kv_lens + [0] * (self.pad_to - len(kv_lens))
@@ -138,6 +140,47 @@ class AscendMLADCPDecodeMetadata(AscendMLADecodeMetadata):
         assert self.actual_seq_lengths_q is not None
         num_padded = len(self.actual_seq_lengths_q) - len(cp_history_seq_len)
         self.cp_history_seq_len = cp_history_seq_len + [0] * num_padded
+
+
+def build_mla_dcp_fia_params(
+    layer_name: str,
+    metadata: AscendMLAMetadata,
+    *,
+    is_draft_model_prefill: bool = False,
+    decode_seq_lens: list[int] | None = None,
+) -> list[dict[str, object]]:
+    """Publish MLA FIA-v2 draft parameters for SharedSource."""
+    decode = getattr(metadata, "decode", None)
+    # 这些层没有捕获 MLA FIA-v2 任务，不发布参数，以免混入其他 backend 的任务。
+    if decode is None or getattr(metadata, "external_flashmla", None) is not None:
+        return []
+
+    if decode_seq_lens is not None:
+        # V2 后续自回归步每个请求只有一个 token，对应一个 FULL 任务。
+        # 长度由调用方按 step 推进，不能复用第一步 metadata 中已经过期的 cp_seq_len。
+        # SharedSource 不调用 Provider.resolve()，这里必须直接发布 FIA-v2 的参数名。
+        return [
+            {
+                "layer_name": (layer_name, CPKVScope.FULL),
+                "actual_seq_kvlen": decode_seq_lens,
+                "block_table": decode.block_table,
+            }
+        ]
+
+    # V1 每步 metadata 和 V2 draft-prefill 都已有当前长度；复用捕获端的拆分策略。
+    use_split = use_history_current_split_decode(
+        metadata,
+        is_draft_model=True,
+        is_draft_model_prefill=is_draft_model_prefill,
+    )
+    kinds = (CPKVScope.HISTORY, CPKVScope.CURRENT) if use_split else (CPKVScope.FULL,)
+    params = []
+    for kind in kinds:
+        pad_to = metadata.num_decode_tokens if kind is CPKVScope.FULL else None
+        provider = MLADCPParamProvider(layer_name, kind, pad_to=pad_to)
+        # layer_name 用来匹配任务；** 将 resolve 返回的 FIA-v2 参数展开到同一个字典。
+        params.append({"layer_name": provider.layer_name, **provider.resolve({layer_name: metadata})})
+    return params
 
 
 class AscendMlaDCPMetadataBuilder(

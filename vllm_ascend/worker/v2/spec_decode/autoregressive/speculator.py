@@ -41,6 +41,7 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
 from vllm_ascend.attention.context_parallel.attention_cp import build_dcp_fia_params
 from vllm_ascend.attention.context_parallel.common_cp import CPKVScope
+from vllm_ascend.attention.context_parallel.mla_cp import build_mla_dcp_fia_params
 from vllm_ascend.attention.dsa_v1 import AscendDSABackend
 from vllm_ascend.attention.indexer import AscendSFAIndexerBackend
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
@@ -876,9 +877,20 @@ class AscendAutoRegressiveSpeculator(LmheadTPDraftSamplingMixin, AutoRegressiveS
         draft_attn_metadata: dict[str, Any],
         is_draft_model_prefill: bool,
     ) -> list[dict[str, Any]]:
-        """Build all GQA DCP draft steps' history/current or cache parameters."""
+        """Build GQA/MLA DCP draft steps' history/current or cache parameters."""
         assert self.dcp_manager is not None
         if is_draft_model_prefill:
+            if self.attn_architecture == "MLA":
+                # 按层发布 HISTORY/CURRENT（或非因果 FULL）任务，身份须与捕获端一致。
+                return [
+                    params
+                    for layer_name, metadata in draft_attn_metadata.items()
+                    for params in build_mla_dcp_fia_params(
+                        layer_name,
+                        metadata,
+                        is_draft_model_prefill=True,
+                    )
+                ]
             return [
                 params
                 for layer_name, metadata in draft_attn_metadata.items()
@@ -909,6 +921,11 @@ class AscendAutoRegressiveSpeculator(LmheadTPDraftSamplingMixin, AutoRegressiveS
             ).tolist()
             for layer_name in self.draft_attn_layer_names:
                 metadata = draft_attn_metadata[layer_name]
+                if self.attn_architecture == "MLA":
+                    # 共用按 step 计算的 DCP 本地长度；具体算子字段由 MLA backend 提供。
+                    # 只生成参数，不修改第一步 metadata，避免后续 step 相互覆盖。
+                    fia_params.extend(build_mla_dcp_fia_params(layer_name, metadata, decode_seq_lens=local_kv_lens))
+                    continue
                 fia_params.append(
                     {
                         "layer_name": (layer_name, CPKVScope.FULL),
